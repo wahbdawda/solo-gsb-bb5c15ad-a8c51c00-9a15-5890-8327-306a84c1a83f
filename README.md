@@ -39,11 +39,19 @@ docker compose up --build
 
 ## 核心语义
 
-- **会话**：创建时登记 `total_chunks`（总分片数）与 `file_digest`（期望的完整文件摘要），分片序号从 `0` 开始。可选失败退避参数 `base_retry_seconds`（默认 `5`，必须为正）与 `max_retry_seconds`（默认 `300`，必须为正且不小于 base）。
+- **会话**：创建时登记 `total_chunks`（总分片数）与 `file_digest`（期望的完整文件摘要），分片序号从 `0` 开始。可选失败退避参数 `base_retry_seconds`（默认 `5`，必须为正）与 `max_retry_seconds`（默认 `300`，必须为正且不小于 base）。`digest_algorithm` 默认 `sha256`，**仅作记录、不做提交校验**（任意非空摘要字符串均可）；显式声明 `sha256-merkle-v1` 时启用 Merkle 完整性校验（见下节）。
 - **依赖（可选）**：创建会话时可提交 `dependencies`（键与值均为分片序号），声明某分片领取租约前必须完成的前置分片。越界、自依赖、有环的依赖图会被拒绝（`422`）；不提供时保持无依赖的原有行为。
 - **租约**：同一分片同一时刻仅允许一个有效租约；租约过期后可被重新领取（令牌轮换）。前置分片未全部完成时领取返回 `409` 及按序缺失的 `missing_dependencies`；前置全部完成后无需额外操作即可领取。
 - **失败上报与退避重试（可选自动生效）**：`POST /sessions/{id}/chunks/{index}/fail` 必须携带该分片**当前有效租约的令牌**；校验通过后在同一事务内**原子清除租约、`failure_count` 加 1**，并将分片置于退避冷却中，第 n 次失败冷却 `min(max_retry_seconds, base_retry_seconds × 2^(n-1))` 秒（默认序列 5、10、20、40、80、160、300、300…）。冷却中的分片**单片与批量领取均跳过/拒绝**，`/ready` 单独列出 `cooling_chunks`；冷却结束后无需干预即可重新领取。令牌不匹配、租约已过期、分片已完成或会话已提交均返回 `409`。
 - **完成上报**：必须携带该分片**当前有效租约的令牌**与分片摘要；以相同令牌 + 相同摘要重复上报为幂等成功（返回 `idempotent_replay: true`），摘要不同则返回 `409`。完成后**清除退避冷却但保留 `failure_count`**。
+- **提交完整性校验（`sha256-merkle-v1`，可选）**：创建会话声明 `"digest_algorithm": "sha256-merkle-v1"` 后：
+  - 创建会话的 `file_digest` 与每次 complete 的 `chunk_digest` **必须是恰好 64 位小写十六进制**（SHA-256 摘要；大写、长度不符、带前缀/空格等一律 `422`），非该算法的会话不做此限制；
+  - 提交（finalize）时服务端**按分片序号**读取各分片摘要（与完成先后顺序无关），按下列字节级规则重建 Merkle 树并取根：
+    - **叶节点** = `SHA-256(0x00 ‖ 摘要原始 32 字节)`，即把 64 位十六进制 `chunk_digest` 解码为 32 字节，前置 **1 字节 `0x00`** 后哈希；
+    - **父节点** = `SHA-256(0x01 ‖ 左子节点 32 字节 ‖ 右子节点 32 字节)`，每层按序号两两配对（左序号小、右序号大）；
+    - 每层节点数为**奇数**时，**末节点复制自身**后再配对（`SHA-256(0x01 ‖ N ‖ N)`），复制仅用于配对，逐层向上直至只剩单一根节点；单分片会话的根就是其唯一叶节点，不再额外复制；
+  - 得到的根（64 位小写十六进制）与创建时登记的 `file_digest` 做**常量时间比较**：**不匹配返回 `409`**，响应体为 `{"detail": "file digest mismatch", "computed_digest": "<服务端算出的根>"}`，此时**不写入任何状态——会话保持 `active`**、各分片保持 `completed`，可用 reopen 纠错或直接修正后重新提交；**匹配**才沿用现有原子提交（置 `finalized`、写 `finalized_at`）并返回清单，重复提交仍幂等。
+  - 完整性校验发生在“分片齐全”检查之后：尚有缺失分片时仍返回 `409` + `missing_chunks`，不计算根。
 - **完成纠错回退（reopen）**：`POST /sessions/{id}/chunks/{index}/reopen` 凭目标分片**完成时保留的租约令牌**与 `expected_digest`（完成时上报的摘要）发起，仅允许**未提交会话中已完成且凭据匹配**的分片。校验通过后服务端沿依赖图找出**全部传递下游**，在**同一事务**内将目标及下游重置为 `pending`：清除摘要、完成时间、有效租约与退避截止时间，**保留累计失败次数**；同时会话 `revision` 递增 1。响应中的 `affected_chunks` 按**（拓扑层级, 分片序号）**升序稳定排列（目标层级为 0，层级取受影响子图中的最长路径）。任一校验失败（会话已提交 / 分片未完成 / 凭据不匹配）返回 `409` 且**不产生任何部分回退**；整个回退与并发领取互斥，领取方不会看到中间状态。
 - **会话级并发上限（可选）**：创建会话时可设置 `max_active_leases`，限制该会话**当前有效（未过期）租约**的总数。单片领取在槽位占满时返回 `409`；批量领取则原子地领取至多 `min(count, 剩余槽位, 可领取分片数)` 个租约。不设置（`null`）时保持原有不限并发的行为。
 - **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、**不在退避冷却中**、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项时返回空列表及 `active` / `blocked` / `next_expiry` 汇总，其中 **`next_expiry` 取有效租约最早过期时间与各分片退避最早结束时间中的更早者**。
@@ -54,7 +62,7 @@ docker compose up --build
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数） |
+| `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数、`digest_algorithm: "sha256-merkle-v1"` 完整性校验） |
 | `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`failure_count`、`retry_after`、退避参数、当前 `active_leases` 与会话 `revision`） |
 | `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片，以及退避冷却中的分片（`cooling_chunks`） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（同样受 `max_active_leases` 与退避冷却约束） |
@@ -244,6 +252,70 @@ curl -s http://localhost:8000/sessions/$SID
 curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 ```
 
+## 完整性校验 sha256-merkle-v1（字节级规则与示例）
+
+默认 `digest_algorithm: "sha256"` 仅作记录；只有显式声明 `"sha256-merkle-v1"` 才会在提交时校验。
+该模式下 `file_digest` 与每个 `chunk_digest` 都必须是 **64 位小写十六进制**（即 32 字节 SHA-256 的十六进制表示，不接受大写或 `0x` 前缀）。
+
+建树规则（所有哈希输入均为字节，不使用十六进制字符串直接哈希）：
+
+```
+叶节点  L[i]   = SHA256( 0x00 || bytes(digest[i]) )      # 前置 1 字节 0x00
+父节点  P(i,j) = SHA256( 0x01 || L_i || L_j )            # 前置 1 字节 0x01，后接左右各 32 字节
+奇数层：复制该层最后一个节点凑成偶数后再两两配对
+根：逐层向上直到只剩一个节点，其十六进制即最终 file_digest
+```
+
+客户端可用如下 Python 片段自行计算期望根（与服务端一致）：
+
+```python
+import hashlib
+
+def merkle_root(chunk_digests_hex: list[str]) -> str:
+    level = [hashlib.sha256(b"\x00" + bytes.fromhex(d)).digest()
+             for d in chunk_digests_hex]           # 叶：0x00
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])                # 奇数末节点复制自身
+        level = [hashlib.sha256(b"\x01" + level[i] + level[i + 1]).digest()
+                 for i in range(0, len(level), 2)] # 父：0x01 || 左 || 右
+    return level[0].hex()
+```
+
+**5 个分片的完整算例**（奇数末节点在第 1、2 层各复制一次）。各分片内容为 ASCII `chunk-0`…`chunk-4`，
+complete 时上报的 `chunk_digest` 为分片原始字节的 SHA-256：
+
+| 分片 | 内容 | chunk_digest（= SHA256(内容)） |
+|---|---|---|
+| 0 | `chunk-0` | `b18efa847f7a3fa48fe0aafd4a6250aa5129740e05126859377af20cedafdeee` |
+| 1 | `chunk-1` | `2725aea2d2dea736fbe38e41ecb518f6098cb68ac77362c5e34faafb356567c5` |
+| 2 | `chunk-2` | `b6f3c15844fe12f966ad90db59da8332a9a6d9dfd198ac83949be2045ec6dc1e` |
+| 3 | `chunk-3` | `dfd3744075c1ae74c2350ff6344acbcc7de7b5559dda9f144cfb4cabd6a1e1dd` |
+| 4 | `chunk-4` | `fd5c781760392e94ca75b8328180658e391f92b7b8c97cd17af44dc2bf5cde99` |
+
+```
+L0 = 5 个叶节点 = SHA256(0x00 || 摘要字节)
+L1 = [ P(0,1), P(2,3), P(4,4) ]     # 第 1 层 5 个为奇数：复制节点 4 与自身配对
+L2 = [ P(a,b),   P(c,c) ]           # 第 2 层 3 个为奇数：复制末节点 c 与自身配对
+root = P(L2[0], L2[1])
+   = eaf7d74711332fe97a8cbec15b70ef514877e6d4bb5b0e793d40ffe6924124ac
+```
+
+因此创建该会话时 `file_digest` 应登记为
+`eaf7d74711332fe97a8cbec15b70ef514877e6d4bb5b0e793d40ffe6924124ac`。
+若任一 `chunk_digest` 与预期不符，finalize 返回：
+
+```json
+{"detail": "file digest mismatch",
+ "computed_digest": "eaf7d74711332fe97a8cbec15b70ef514877e6d4bb5b0e793d40ffe6924124ac"}
+```
+
+此时会话仍是 `active`；可用 reopen 回退错误分片重传后重新提交，重复提交幂等。
+最简单的双分片情形：根就是 `SHA256(0x01 ‖ SHA256(0x00‖d0) ‖ SHA256(0x00‖d1))`，
+对上面分片 0、1 的根为 `afb70a6bf3d2e02a7777eb5580a34df9c63398937ac3cff6fdb74463769c660a`。
+
+`GET /sessions/{id}` 与创建响应中均包含 `digest_algorithm` 字段，调用方可据此区分会话是否启用了校验。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -261,12 +333,17 @@ python3 -m pytest tests/ -q
 
 ```
 app/
-  main.py      # FastAPI 应用与全部端点
-  db.py        # SQLite 连接与建库建表（启动时自动执行）
-  schemas.py   # Pydantic 请求/响应模型
+  main.py       # FastAPI 应用与全部端点
+  db.py         # SQLite 连接与建库建表（启动时自动执行）
+  schemas.py    # Pydantic 请求/响应模型
+  integrity.py  # sha256-merkle-v1 摘要格式与 Merkle 根计算
 tests/
   test_api.py  # 租约独占/过期、幂等、提交等端到端行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt
 ```
+
+`digest_algorithm` 列在建表初期即已存在，启用 Merkle 校验**不引入任何数据库结构变更**：
+旧 SQLite 数据无需迁移或重写，既有会话（默认/其它算法标识）继续按“仅记录、不校验”的旧行为运行，
+`docker compose up --build` 一键启动方式不变。

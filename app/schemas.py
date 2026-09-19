@@ -6,6 +6,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from .integrity import MERKLE_DIGEST_ALGORITHM, is_sha256_hex
+
 
 def validate_dependencies(
     dependencies: dict[int, list[int]], total_chunks: int
@@ -53,7 +55,9 @@ class CreateSessionRequest(BaseModel):
     total_chunks: int = Field(ge=1, le=100_000, description="总分片数")
     file_digest: str = Field(min_length=1, max_length=256, description="期望的完整文件摘要")
     digest_algorithm: str = Field(default="sha256", min_length=1, max_length=32,
-                                  description="摘要算法标识，仅作记录")
+                                  description="摘要算法标识；默认 sha256 仅作记录不做提交校验，"
+                                              "sha256-merkle-v1 启用 Merkle 完整性校验"
+                                              "（此时 file_digest 必须为 64 位小写十六进制）")
     dependencies: Optional[dict[int, list[int]]] = Field(
         default=None,
         description="分片依赖图：键为分片序号，值为该分片领取租约前必须完成的前置分片序号列表；"
@@ -75,6 +79,16 @@ class CreateSessionRequest(BaseModel):
     def _validate_dependencies(self):
         if self.dependencies:
             self.dependencies = validate_dependencies(self.dependencies, self.total_chunks)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_digest_format(self):
+        # 仅 sha256-merkle-v1 强制摘要格式；其它算法标识保持“任意非空字符串仅作记录”的旧行为
+        if self.digest_algorithm == MERKLE_DIGEST_ALGORITHM and not is_sha256_hex(self.file_digest):
+            raise ValueError(
+                "file_digest must be 64 lowercase hex characters"
+                " when digest_algorithm is sha256-merkle-v1"
+            )
         return self
 
     @model_validator(mode="after")
@@ -148,7 +162,10 @@ class BatchLeaseResponse(BaseModel):
 
 class CompleteRequest(BaseModel):
     lease_token: str = Field(min_length=1, max_length=128, description="当前有效租约令牌")
-    chunk_digest: str = Field(min_length=1, max_length=256, description="该分片的摘要")
+    chunk_digest: str = Field(
+        min_length=1, max_length=256,
+        description="该分片的摘要；会话 digest_algorithm 为 sha256-merkle-v1 时"
+                    "必须为 64 位小写十六进制")
 
 
 class CompleteResponse(BaseModel):

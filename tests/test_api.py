@@ -1,4 +1,5 @@
 """API 行为测试：租约独占/过期、幂等上报、提交与状态查询。"""
+import hashlib
 import os
 import tempfile
 import threading
@@ -1199,3 +1200,227 @@ def test_migration_adds_revision_to_legacy_database(tmp_path):
     assert row[0] == 0
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- sha256-merkle-v1 完整性校验
+
+def ref_merkle_root(digests):
+    """独立于实现的参考算法：叶 SHA256(0x00||d)，父 SHA256(0x01||l||r)，奇数末节点复制。"""
+    level = [hashlib.sha256(b"\x00" + bytes.fromhex(d)).digest() for d in digests]
+    assert level
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])
+        level = [
+            hashlib.sha256(b"\x01" + level[i] + level[i + 1]).digest()
+            for i in range(0, len(level), 2)
+        ]
+    return level[0].hex()
+
+
+def make_merkle_session(total_chunks, file_digest=None, dependencies=None):
+    digests = [f"{i:064x}" for i in range(total_chunks)]
+    if file_digest is None:
+        file_digest = ref_merkle_root(digests)
+    payload = {
+        "total_chunks": total_chunks,
+        "file_digest": file_digest,
+        "digest_algorithm": "sha256-merkle-v1",
+    }
+    if dependencies is not None:
+        payload["dependencies"] = {str(k): v for k, v in dependencies.items()}
+    resp = client.post("/sessions", json=payload)
+    assert resp.status_code == 201, resp.text
+    return resp.json(), digests
+
+
+def lease_complete_digest(session_id, index, digest):
+    token = lease(session_id, index).json()["lease_token"]
+    r = complete(session_id, index, token, digest)
+    assert r.status_code == 200, r.text
+    return r
+
+
+def complete_all_merkle(session_id, digests):
+    for i, d in enumerate(digests):
+        lease_complete_digest(session_id, i, d)
+
+
+def test_merkle_create_requires_lowercase_hex_file_digest():
+    base = {"total_chunks": 2, "digest_algorithm": "sha256-merkle-v1"}
+    # 大写 / 长度不对 / 非十六进制 / 空串
+    assert client.post("/sessions", json={**base, "file_digest": "A" * 64}).status_code == 422
+    assert client.post("/sessions", json={**base, "file_digest": "a" * 63}).status_code == 422
+    assert client.post("/sessions", json={**base, "file_digest": "g" * 64}).status_code == 422
+    assert client.post("/sessions", json={**base, "file_digest": " " + "a" * 64}).status_code == 422
+    # 合法 64 位小写十六进制可创建
+    ok = client.post("/sessions", json={**base, "file_digest": "a" * 64})
+    assert ok.status_code == 201
+    assert ok.json()["digest_algorithm"] == "sha256-merkle-v1"
+
+
+def test_merkle_complete_requires_lowercase_hex_chunk_digest():
+    s, _ = make_merkle_session(2)
+    token = lease(s["id"], 0).json()["lease_token"]
+    # 大写 / 长度不对 / 非十六进制 => 422，租约仍保留
+    for bad in ("A" * 64, "a" * 63, "g" * 64, "0x" + "a" * 62):
+        r = complete(s["id"], 0, token, bad)
+        assert r.status_code == 422, bad
+    # 校验失败不消费租约：合法摘要仍可凭同一令牌完成
+    assert complete(s["id"], 0, token, "a" * 64).status_code == 200
+
+    # 已完成分片再用非法格式重放：先做格式校验（422），而非进入幂等冲突分支
+    assert complete(s["id"], 0, token, "not-hex").status_code == 422
+
+
+def test_merkle_finalize_matches_for_even_leaf_count():
+    s, digests = make_merkle_session(4)
+    complete_all_merkle(s["id"], digests)
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "finalized"
+    assert body["digest_algorithm"] == "sha256-merkle-v1"
+    assert body["file_digest"] == ref_merkle_root(digests)
+
+
+def test_merkle_finalize_duplicates_odd_last_node_each_level():
+    # 5 个分片：第 1 层 5 -> 复制末节点 -> 3 个父节点；第 2 层 3 -> 复制 -> 2；第 3 层得根
+    s, digests = make_merkle_session(5)
+    complete_all_merkle(s["id"], digests)
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 200, r.text
+    assert r.json()["file_digest"] == ref_merkle_root(digests)
+
+
+def test_merkle_single_chunk_root_is_leaf_hash():
+    s, digests = make_merkle_session(1)
+    complete_all_merkle(s["id"], digests)
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+    # 根 = SHA256(0x00 || 唯一分片摘要原始字节)，不再额外复制配对
+    assert s["file_digest"] == hashlib.sha256(
+        b"\x00" + bytes.fromhex(digests[0])).hexdigest()
+
+
+def test_merkle_finalize_still_reports_missing_chunks_first():
+    s, digests = make_merkle_session(3, file_digest="0" * 64)
+    lease_complete_digest(s["id"], 0, digests[0])
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 409
+    assert r.json() == {"detail": "upload incomplete", "missing_chunks": [1, 2]}
+    assert client.get(f"/sessions/{s['id']}").json()["status"] == "active"
+
+
+def test_merkle_mismatch_returns_409_computed_digest_and_keeps_active():
+    # 登记错误的期望根
+    s, digests = make_merkle_session(3, file_digest="0" * 64)
+    complete_all_merkle(s["id"], digests)
+
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 409
+    body = r.json()
+    expected_root = ref_merkle_root(digests)
+    assert body["detail"] == "file digest mismatch"
+    assert body["computed_digest"] == expected_root
+    assert expected_root != "0" * 64
+
+    # 会话保持 active：不写入 finalized_at，仍可纠错（reopen）后重新提交
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["status"] == "active"
+    assert st["finalized_at"] is None
+    assert all(c["status"] == "completed" for c in st["chunks"])
+    # 不匹配不影响租约/完成之外的操作：分片仍为 completed 不可再领取
+    assert lease(s["id"], 0).status_code == 409
+
+
+def test_merkle_mismatch_recoverable_via_reopen_then_finalize():
+    s, digests = make_merkle_session(2, dependencies={1: [0]})
+    complete_all_merkle(s["id"], digests)
+    # 把期望根改成另一个值，模拟某分片内容有误导致整树不匹配
+    get_conn().execute(
+        "UPDATE sessions SET file_digest = ? WHERE id = ?",
+        ("1" * 64, s["id"]),
+    )
+    get_conn().commit()
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 409
+    computed = r.json()["computed_digest"]
+
+    # reopen 目标分片（下游随之回退），用正确内容重传，并把期望根修正为实际根
+    token0 = get_conn().execute(
+        "SELECT lease_token FROM chunks WHERE session_id = ? AND chunk_index = 0",
+        (s["id"],),
+    ).fetchone()[0]
+    assert reopen(s["id"], 0, token0, digests[0]).status_code == 200
+    lease_complete_digest(s["id"], 0, digests[0])
+    lease_complete_digest(s["id"], 1, digests[1])
+    get_conn().execute(
+        "UPDATE sessions SET file_digest = ? WHERE id = ?",
+        (computed, s["id"]),
+    )
+    get_conn().commit()
+    ok = client.post(f"/sessions/{s['id']}/finalize")
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["status"] == "finalized"
+
+
+def test_merkle_finalize_idempotent_after_success():
+    s, digests = make_merkle_session(4)
+    complete_all_merkle(s["id"], digests)
+    first = client.post(f"/sessions/{s['id']}/finalize")
+    assert first.status_code == 200
+    again = client.post(f"/sessions/{s['id']}/finalize")
+    assert again.status_code == 200
+    assert again.json()["manifest"] == first.json()["manifest"]
+    assert again.json()["finalized_at"] == first.json()["finalized_at"]
+
+
+def test_merkle_status_exposes_digest_algorithm():
+    s, _ = make_merkle_session(2)
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["digest_algorithm"] == "sha256-merkle-v1"
+
+
+def test_non_merkle_algorithms_keep_legacy_behaviour():
+    # 显式 sha256（默认）：任意非空 file_digest、任意长度 chunk_digest 均不做格式校验
+    resp = client.post("/sessions", json={
+        "total_chunks": 2,
+        "file_digest": "legacy-digest",
+        "digest_algorithm": "sha256",
+    })
+    assert resp.status_code == 201
+    sid = resp.json()["id"]
+    t0 = lease(sid, 0).json()["lease_token"]
+    assert complete(sid, 0, t0, "abc123").status_code == 200  # 非 64 位十六进制也接受
+    t1 = lease(sid, 1).json()["lease_token"]
+    assert complete(sid, 1, t1, "ZZZ").status_code == 200
+    # 提交不做任何摘要比对，即使 file_digest 与分片摘要无关
+    ok = client.post(f"/sessions/{sid}/finalize")
+    assert ok.status_code == 200
+    assert ok.json()["file_digest"] == "legacy-digest"
+
+
+def test_unknown_algorithm_identifier_is_recorded_only():
+    # 未知/自定义算法标识：与 sha256 一样仅作记录，提交不校验
+    resp = client.post("/sessions", json={
+        "total_chunks": 1, "file_digest": "whatever",
+        "digest_algorithm": "custom-v9",
+    })
+    assert resp.status_code == 201
+    sid = resp.json()["id"]
+    t = lease(sid, 0).json()["lease_token"]
+    assert complete(sid, 0, t, "d").status_code == 200
+    assert client.post(f"/sessions/{sid}/finalize").status_code == 200
+    assert client.get(f"/sessions/{sid}").json()["digest_algorithm"] == "custom-v9"
+
+
+def test_merkle_with_dependencies_finalize_in_index_order():
+    # 依赖图只影响领取顺序；Merkle 仍按分片序号（不是完成顺序）建树
+    s, digests = make_merkle_session(3, dependencies={2: [0, 1]})
+    # 乱序完成：1 -> 0 -> 2
+    for i in (1, 0, 2):
+        lease_complete_digest(s["id"], i, digests[i])
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 200, r.text
+    assert [m["chunk_index"] for m in r.json()["manifest"]] == [0, 1, 2]
+    assert r.json()["file_digest"] == ref_merkle_root(digests)

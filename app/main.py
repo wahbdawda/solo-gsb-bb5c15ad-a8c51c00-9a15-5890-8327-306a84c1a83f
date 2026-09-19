@@ -12,7 +12,9 @@
   已完成且凭据匹配的分片；同一事务内将目标及依赖图中的全部传递下游重置为 pending
   （清除摘要、完成时间、有效租约与退避截止时间，保留累计失败次数），会话 revision 递增 1；
   任一校验失败不产生部分回退，并发领取不会看到中间状态
-- 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片
+- 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片；
+  sha256-merkle-v1 会话在首次提交时按分片摘要重建 Merkle 根并与 file_digest
+  常量时间比较，不匹配返回 409 与 computed_digest 且会话保持 active
 - 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间，以及会话 revision）
 - 就绪查询：当前可领取的分片、被依赖阻塞的分片以及退避冷却中的分片
 """
@@ -29,6 +31,12 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from .db import DB_LOCK, get_conn, init_db
+from .integrity import (
+    constant_time_hex_equal,
+    is_merkle_algorithm,
+    is_sha256_hex,
+    merkle_root_hex,
+)
 from .schemas import (
     BatchLeaseItem,
     BatchLeaseRequest,
@@ -255,6 +263,10 @@ def claimable_chunks(session_id: str, now: datetime) -> tuple[list[int], int]:
 
 def conflict(message: str, **extra) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": message, **extra})
+
+
+def unprocessable(message: str, **extra) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": message, **extra})
 
 
 # ---------------------------------------------------------------- 会话
@@ -567,6 +579,13 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
         session = get_session_or_404(session_id)
         chunk = get_chunk_or_404(session_id, chunk_index)
 
+        # sha256-merkle-v1 会话强制分片摘要为 64 位小写十六进制；其它算法不限制
+        if is_merkle_algorithm(session["digest_algorithm"]) and not is_sha256_hex(req.chunk_digest):
+            return unprocessable(
+                "chunk_digest must be 64 lowercase hex characters"
+                " when digest_algorithm is sha256-merkle-v1"
+            )
+
         if chunk["status"] == "completed":
             # 幂等重放：同一租约令牌 + 同一摘要 => 返回首次完成结果
             if chunk["lease_token"] == req.lease_token and chunk["chunk_digest"] == req.chunk_digest:
@@ -717,7 +736,10 @@ def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
     response_model=FinalizeResponse,
     tags=["sessions"],
     summary="提交会话（全部分片完成后）",
-    responses={409: {"description": "存在缺失分片，响应体包含 missing_chunks"}},
+    responses={
+        409: {"description": "存在缺失分片，或 sha256-merkle-v1 完整性校验不通过"
+                               "（响应体包含 missing_chunks 或 computed_digest）"},
+    },
 )
 def finalize_session(session_id: str):
     with DB_LOCK:
@@ -734,13 +756,25 @@ def finalize_session(session_id: str):
         now = utcnow()
         finalized_at = parse_ts(session["finalized_at"]) if session["finalized_at"] else None
         if session["status"] != "finalized":
+            # sha256-merkle-v1：提交时按分片序号重建 Merkle 根并与 file_digest 常量时间比较。
+            # 不匹配则不写入任何状态：会话保持 active、分片保持 completed，可通过 reopen
+            # 纠错后重新提交；响应携带 computed_digest 供调用方定位差异。
+            if is_merkle_algorithm(session["digest_algorithm"]):
+                computed_digest = merkle_root_hex(
+                    [r["chunk_digest"] for r in rows]
+                )
+                if not constant_time_hex_equal(computed_digest, session["file_digest"]):
+                    return conflict(
+                        "file digest mismatch",
+                        computed_digest=computed_digest,
+                    )
             finalized_at = now
             get_conn().execute(
                 "UPDATE sessions SET status = 'finalized', finalized_at = ? WHERE id = ?",
                 (finalized_at.isoformat(), session_id),
             )
             get_conn().commit()
-        # 已 finalized 时重复提交：幂等返回同一份清单
+        # 已 finalized 时重复提交：幂等返回同一份清单（首次提交时已通过完整性校验）
 
     return FinalizeResponse(
         session_id=session_id,
