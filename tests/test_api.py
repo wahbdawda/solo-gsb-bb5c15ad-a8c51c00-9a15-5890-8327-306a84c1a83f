@@ -1,4 +1,5 @@
 """API 行为测试：租约独占/过期、幂等上报、提交与状态查询。"""
+import hashlib
 import os
 import tempfile
 import threading
@@ -1199,3 +1200,199 @@ def test_migration_adds_revision_to_legacy_database(tmp_path):
     assert row[0] == 0
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- Merkle 完整性校验（sha256-merkle-v1）
+
+def merkle_root_of(digests):
+    """按字节级规则独立实现的参考计算：叶 SHA-256(0x00||raw32)，
+    父 SHA-256(0x01||左32||右32)，奇数末节点复制自身，逐层归约。"""
+    level = [hashlib.sha256(b"\x00" + bytes.fromhex(d)).digest() for d in digests]
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])
+        level = [
+            hashlib.sha256(b"\x01" + level[i] + level[i + 1]).digest()
+            for i in range(0, len(level), 2)
+        ]
+    return level[0].hex()
+
+
+def chunk_digests(total):
+    """生成确定性的分片摘要：sha256(b"chunk-<i>") 的小写十六进制。"""
+    return [hashlib.sha256(f"chunk-{i}".encode()).hexdigest() for i in range(total)]
+
+
+def make_merkle_session(total_chunks, file_digest):
+    resp = client.post("/sessions", json={
+        "total_chunks": total_chunks,
+        "file_digest": file_digest,
+        "digest_algorithm": "sha256-merkle-v1",
+    })
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def complete_all(session_id, digests):
+    """依次领取并完成全部分片；返回 {chunk_index: (lease_token, digest)}。"""
+    creds = {}
+    for i, digest in enumerate(digests):
+        token = lease(session_id, i).json()["lease_token"]
+        assert complete(session_id, i, token, digest).status_code == 200
+        creds[i] = (token, digest)
+    return creds
+
+
+def test_merkle_session_requires_lowercase_hex_file_digest():
+    for bad in ("F" * 64, "f" * 63, "f" * 65, "g" * 64, "0" * 64 + " ", ""):
+        resp = client.post("/sessions", json={
+            "total_chunks": 2,
+            "file_digest": bad,
+            "digest_algorithm": "sha256-merkle-v1",
+        })
+        assert resp.status_code == 422, bad
+
+    ok = client.post("/sessions", json={
+        "total_chunks": 2,
+        "file_digest": "f" * 64,
+        "digest_algorithm": "sha256-merkle-v1",
+    })
+    assert ok.status_code == 201
+    assert ok.json()["digest_algorithm"] == "sha256-merkle-v1"
+
+    # 非该算法：file_digest 格式不受限，保持原行为
+    plain = client.post("/sessions", json={
+        "total_chunks": 2, "file_digest": "anything-goes", "digest_algorithm": "sha256",
+    })
+    assert plain.status_code == 201
+
+
+def test_merkle_status_exposes_digest_algorithm():
+    s = make_merkle_session(2, "f" * 64)
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["digest_algorithm"] == "sha256-merkle-v1"
+
+
+def test_merkle_complete_requires_lowercase_hex_chunk_digest():
+    s = make_merkle_session(2, "f" * 64)
+    token = lease(s["id"], 0).json()["lease_token"]
+    for bad in ("A" * 64, "b" * 63, "b" * 65, "zz" * 32, "not-hex"):
+        r = complete(s["id"], 0, token, bad)
+        assert r.status_code == 422, bad
+    # 合法格式正常完成；幂等重放不受影响
+    assert complete(s["id"], 0, token, "b" * 64).status_code == 200
+    r = complete(s["id"], 0, token, "b" * 64)
+    assert r.status_code == 200 and r.json()["idempotent_replay"] is True
+
+    # 非该算法会话：任意摘要格式均可上报（原行为）
+    s2 = make_session()
+    t2 = lease(s2["id"], 0).json()["lease_token"]
+    assert complete(s2["id"], 0, t2, "free-form-digest").status_code == 200
+
+
+def test_merkle_finalize_verifies_root_and_is_idempotent():
+    digests = chunk_digests(4)
+    s = make_merkle_session(4, merkle_root_of(digests))
+    complete_all(s["id"], digests)
+
+    ok = client.post(f"/sessions/{s['id']}/finalize")
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["status"] == "finalized"
+    assert body["digest_algorithm"] == "sha256-merkle-v1"
+    assert [m["chunk_digest"] for m in body["manifest"]] == digests
+
+    # 重复提交幂等返回同一清单
+    again = client.post(f"/sessions/{s['id']}/finalize")
+    assert again.status_code == 200
+    assert again.json()["manifest"] == body["manifest"]
+    assert again.json()["finalized_at"] == body["finalized_at"]
+
+
+def test_merkle_finalize_known_vectors():
+    # 硬编码已知向量（独立计算）：防止奇数复制/域分离字节规则被改动
+    vectors = {
+        ("00" * 32,): "7f9c9e31ac8256ca2f258583df262dbc7d6f68f2a03043d5c99a4ae5a7396ce9",
+        ("00" * 32, "11" * 32, "22" * 32):
+            "d09bdfda1282f5b832eb6afd304f68a7249245148a5f8224289701572e241122",
+        ("00" * 32, "11" * 32, "22" * 32, "33" * 32):
+            "23cddd0a87e9f0e8b557376ed3156858efd19c6666db3f1e176db6b9546e0a5e",
+    }
+    for digests, root in vectors.items():
+        assert merkle_root_of(list(digests)) == root
+        s = make_merkle_session(len(digests), root)
+        complete_all(s["id"], list(digests))
+        assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+
+
+def test_merkle_finalize_odd_chunk_count_duplicates_last():
+    # 3、5 个分片：奇数层末节点复制自身后配对（参考实现与已知向量一致）
+    for total in (3, 5):
+        digests = chunk_digests(total)
+        s = make_merkle_session(total, merkle_root_of(digests))
+        complete_all(s["id"], digests)
+        assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+
+
+def test_merkle_finalize_mismatch_returns_409_and_session_stays_active():
+    digests = chunk_digests(3)
+    wrong_root = "0" * 64
+    assert wrong_root != merkle_root_of(digests)
+    s = make_merkle_session(3, wrong_root)
+    complete_all(s["id"], digests)
+
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 409
+    body = r.json()
+    assert body["computed_digest"] == merkle_root_of(digests)
+
+    # 会话保持 active：不写入任何提交状态，重复提交得到同样的 409
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["status"] == "active"
+    assert st["finalized_at"] is None
+    r2 = client.post(f"/sessions/{s['id']}/finalize")
+    assert r2.status_code == 409
+    assert r2.json()["computed_digest"] == body["computed_digest"]
+
+
+def test_merkle_finalize_mismatch_then_reopen_and_fix():
+    # 分片 1 上报了错误摘要：先 409，reopen 纠错后重新完成即可提交
+    digests = chunk_digests(3)
+    s = make_merkle_session(3, merkle_root_of(digests))
+    bad = digests.copy()
+    bad[1] = hashlib.sha256(b"corrupted").hexdigest()
+    creds = complete_all(s["id"], bad)
+
+    r = client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 409
+    assert r.json()["computed_digest"] == merkle_root_of(bad)
+
+    # 凭完成时保留的令牌与摘要回退分片 1，重新上报正确摘要
+    token1, digest1 = creds[1]
+    assert reopen(s["id"], 1, token1, digest1).status_code == 200
+    new_token = lease(s["id"], 1).json()["lease_token"]
+    assert complete(s["id"], 1, new_token, digests[1]).status_code == 200
+
+    ok = client.post(f"/sessions/{s['id']}/finalize")
+    assert ok.status_code == 200
+    assert [m["chunk_digest"] for m in ok.json()["manifest"]] == digests
+
+
+def test_merkle_finalize_single_chunk():
+    digest = chunk_digests(1)
+    # 单分片：根即叶节点 SHA-256(0x00 || 摘要原始32字节)
+    s = make_merkle_session(1, merkle_root_of(digest))
+    complete_all(s["id"], digest)
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+
+
+def test_non_merkle_session_finalize_skips_verification():
+    # 非 sha256-merkle-v1：finalize 不校验摘要，保持原行为
+    s = make_session(total_chunks=2, file_digest="not-a-merkle-root")
+    t0 = lease(s["id"], 0).json()["lease_token"]
+    t1 = lease(s["id"], 1).json()["lease_token"]
+    assert complete(s["id"], 0, t0, "whatever").status_code == 200
+    assert complete(s["id"], 1, t1, "digests").status_code == 200
+    ok = client.post(f"/sessions/{s['id']}/finalize")
+    assert ok.status_code == 200
+    assert ok.json()["file_digest"] == "not-a-merkle-root"

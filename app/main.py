@@ -12,12 +12,16 @@
   已完成且凭据匹配的分片；同一事务内将目标及依赖图中的全部传递下游重置为 pending
   （清除摘要、完成时间、有效租约与退避截止时间，保留累计失败次数），会话 revision 递增 1；
   任一校验失败不产生部分回退，并发领取不会看到中间状态
-- 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片
+- 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片；
+  会话使用 sha256-merkle-v1 时先按分片序号构建 Merkle 树并与 file_digest
+  常量时间比较，不匹配返回 409 及 computed_digest、会话保持 active
 - 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间，以及会话 revision）
 - 就绪查询：当前可领取的分片、被依赖阻塞的分片以及退避冷却中的分片
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import secrets
 import uuid
@@ -30,6 +34,7 @@ from fastapi.responses import JSONResponse
 
 from .db import DB_LOCK, get_conn, init_db
 from .schemas import (
+    MERKLE_DIGEST_ALGORITHM,
     BatchLeaseItem,
     BatchLeaseRequest,
     BatchLeaseResponse,
@@ -51,6 +56,7 @@ from .schemas import (
     ReopenResponse,
     SessionResponse,
     SessionStatusResponse,
+    is_valid_merkle_digest,
 )
 
 DEFAULT_LEASE_TTL_SECONDS = int(os.environ.get("DEFAULT_LEASE_TTL_SECONDS", "300"))
@@ -120,6 +126,26 @@ def backoff_delay(session, failure_count: int) -> int:
     base = session["base_retry_seconds"]
     cap = session["max_retry_seconds"]
     return min(cap, base * (2 ** (failure_count - 1)))
+
+
+def merkle_root_sha256(digests: list[str]) -> str:
+    """sha256-merkle-v1：按分片序号升序的摘要列表（64 位小写十六进制）计算 Merkle 根。
+
+    字节级规则：
+    - 叶节点 = SHA-256(0x00 || 摘要的原始 32 字节)
+    - 父节点 = SHA-256(0x01 || 左节点 32 字节 || 右节点 32 字节)
+    - 每层节点数为奇数时，末节点复制自身后配对
+    - 逐层归约直至单一根，返回其小写十六进制编码
+    """
+    level = [hashlib.sha256(b"\x00" + bytes.fromhex(d)).digest() for d in digests]
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])  # 奇数末节点复制自身后配对
+        level = [
+            hashlib.sha256(b"\x01" + level[i] + level[i + 1]).digest()
+            for i in range(0, len(level), 2)
+        ]
+    return level[0].hex()
 
 
 def load_dependencies(session_id: str) -> dict[int, list[int]]:
@@ -567,6 +593,15 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
         session = get_session_or_404(session_id)
         chunk = get_chunk_or_404(session_id, chunk_index)
 
+        if session["digest_algorithm"] == MERKLE_DIGEST_ALGORITHM and not is_valid_merkle_digest(
+            req.chunk_digest
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="chunk_digest must be 64 lowercase hex characters "
+                       "for sha256-merkle-v1 sessions",
+            )
+
         if chunk["status"] == "completed":
             # 幂等重放：同一租约令牌 + 同一摘要 => 返回首次完成结果
             if chunk["lease_token"] == req.lease_token and chunk["chunk_digest"] == req.chunk_digest:
@@ -716,8 +751,9 @@ def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
     "/sessions/{session_id}/finalize",
     response_model=FinalizeResponse,
     tags=["sessions"],
-    summary="提交会话（全部分片完成后）",
-    responses={409: {"description": "存在缺失分片，响应体包含 missing_chunks"}},
+    summary="提交会话（全部分片完成后；sha256-merkle-v1 会话先校验 Merkle 根）",
+    responses={409: {"description": "存在缺失分片（missing_chunks），"
+                                    "或 Merkle 根与 file_digest 不匹配（computed_digest）"}},
 )
 def finalize_session(session_id: str):
     with DB_LOCK:
@@ -730,6 +766,13 @@ def finalize_session(session_id: str):
         missing = [r["chunk_index"] for r in rows if r["status"] != "completed"]
         if missing:
             return conflict("upload incomplete", missing_chunks=missing)
+
+        if session["digest_algorithm"] == MERKLE_DIGEST_ALGORITHM:
+            # 按分片序号升序读取摘要构建 Merkle 树，与 file_digest 常量时间比较；
+            # 不匹配时不做任何写入，会话保持 active，可纠错后重试
+            computed = merkle_root_sha256([r["chunk_digest"] for r in rows])
+            if not hmac.compare_digest(computed, session["file_digest"]):
+                return conflict("file digest mismatch", computed_digest=computed)
 
         now = utcnow()
         finalized_at = parse_ts(session["finalized_at"]) if session["finalized_at"] else None

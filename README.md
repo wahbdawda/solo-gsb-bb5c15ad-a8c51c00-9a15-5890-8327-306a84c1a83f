@@ -39,7 +39,7 @@ docker compose up --build
 
 ## 核心语义
 
-- **会话**：创建时登记 `total_chunks`（总分片数）与 `file_digest`（期望的完整文件摘要），分片序号从 `0` 开始。可选失败退避参数 `base_retry_seconds`（默认 `5`，必须为正）与 `max_retry_seconds`（默认 `300`，必须为正且不小于 base）。
+- **会话**：创建时登记 `total_chunks`（总分片数）与 `file_digest`（期望的完整文件摘要），分片序号从 `0` 开始。可选 `digest_algorithm`（默认 `sha256`，仅作记录；取 `sha256-merkle-v1` 时启用提交时的 Merkle 完整性校验）。可选失败退避参数 `base_retry_seconds`（默认 `5`，必须为正）与 `max_retry_seconds`（默认 `300`，必须为正且不小于 base）。
 - **依赖（可选）**：创建会话时可提交 `dependencies`（键与值均为分片序号），声明某分片领取租约前必须完成的前置分片。越界、自依赖、有环的依赖图会被拒绝（`422`）；不提供时保持无依赖的原有行为。
 - **租约**：同一分片同一时刻仅允许一个有效租约；租约过期后可被重新领取（令牌轮换）。前置分片未全部完成时领取返回 `409` 及按序缺失的 `missing_dependencies`；前置全部完成后无需额外操作即可领取。
 - **失败上报与退避重试（可选自动生效）**：`POST /sessions/{id}/chunks/{index}/fail` 必须携带该分片**当前有效租约的令牌**；校验通过后在同一事务内**原子清除租约、`failure_count` 加 1**，并将分片置于退避冷却中，第 n 次失败冷却 `min(max_retry_seconds, base_retry_seconds × 2^(n-1))` 秒（默认序列 5、10、20、40、80、160、300、300…）。冷却中的分片**单片与批量领取均跳过/拒绝**，`/ready` 单独列出 `cooling_chunks`；冷却结束后无需干预即可重新领取。令牌不匹配、租约已过期、分片已完成或会话已提交均返回 `409`。
@@ -47,8 +47,70 @@ docker compose up --build
 - **完成纠错回退（reopen）**：`POST /sessions/{id}/chunks/{index}/reopen` 凭目标分片**完成时保留的租约令牌**与 `expected_digest`（完成时上报的摘要）发起，仅允许**未提交会话中已完成且凭据匹配**的分片。校验通过后服务端沿依赖图找出**全部传递下游**，在**同一事务**内将目标及下游重置为 `pending`：清除摘要、完成时间、有效租约与退避截止时间，**保留累计失败次数**；同时会话 `revision` 递增 1。响应中的 `affected_chunks` 按**（拓扑层级, 分片序号）**升序稳定排列（目标层级为 0，层级取受影响子图中的最长路径）。任一校验失败（会话已提交 / 分片未完成 / 凭据不匹配）返回 `409` 且**不产生任何部分回退**；整个回退与并发领取互斥，领取方不会看到中间状态。
 - **会话级并发上限（可选）**：创建会话时可设置 `max_active_leases`，限制该会话**当前有效（未过期）租约**的总数。单片领取在槽位占满时返回 `409`；批量领取则原子地领取至多 `min(count, 剩余槽位, 可领取分片数)` 个租约。不设置（`null`）时保持原有不限并发的行为。
 - **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、**不在退避冷却中**、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项时返回空列表及 `active` / `blocked` / `next_expiry` 汇总，其中 **`next_expiry` 取有效租约最早过期时间与各分片退避最早结束时间中的更早者**。
-- **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。
+- **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。会话使用 `sha256-merkle-v1` 时，提交前先按分片序号构建 Merkle 树并与 `file_digest` 常量时间比较，不匹配返回 `409` 及 `computed_digest`，会话保持 `active`（见下文「完整性校验」）。
 - 已完成的分片不可再领取租约；已提交的会话进入只读状态。
+
+## 完整性校验（sha256-merkle-v1，可选）
+
+创建会话时将 `digest_algorithm` 设为 `sha256-merkle-v1` 即启用端到端完整性校验；
+其余取值（含默认的 `sha256`）仅作记录，行为与之前完全一致。
+
+启用后的约束与规则：
+
+- **摘要格式**：创建会话的 `file_digest` 与每次 complete 的 `chunk_digest` 必须是
+  **64 位小写十六进制**（SHA-256 的 32 字节十六进制编码），否则返回 `422`。
+  `chunk_digest` 应取该分片原始内容的 SHA-256。
+- **提交时校验**：finalize 按分片序号升序读取各 `chunk_digest`，构建 Merkle 树：
+  - 叶节点：`leaf = SHA-256(0x00 || chunk_digest 的原始 32 字节)`
+  - 父节点：`parent = SHA-256(0x01 || 左节点 32 字节 || 右节点 32 字节)`
+  - 每层节点数为奇数时，**末节点复制自身**后配对
+  - 逐层归约直至单一根（单分片会话的根即唯一叶节点）
+- **比较与结果**：根的小写十六进制与 `file_digest` 做**常量时间比较**。
+  不匹配返回 `409` 及 `computed_digest`（服务端算出的根），**不做任何写入、会话保持
+  `active`**，可通过 reopen 纠错后重试；匹配才沿用现有的原子提交与幂等响应。
+
+参考计算（Python）：
+
+```python
+import hashlib
+
+def merkle_root(chunk_digests_hex):
+    level = [hashlib.sha256(b"\x00" + bytes.fromhex(d)).digest()
+             for d in chunk_digests_hex]
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])            # 奇数末节点复制自身
+        level = [hashlib.sha256(b"\x01" + level[i] + level[i + 1]).digest()
+                 for i in range(0, len(level), 2)]
+    return level[0].hex()
+```
+
+调用示例（curl）：
+
+```bash
+# 1. 客户端先算出每个分片的 SHA-256（64 位小写十六进制），再算出 Merkle 根
+ROOT=$(python3 -c '...')   # 上述 merkle_root([d0, d1, d2, ...])
+
+# 2. 创建启用完整性校验的会话，file_digest 登记 Merkle 根
+SID=$(curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d "{\"total_chunks\": 3, \"file_digest\": \"$ROOT\",
+       \"digest_algorithm\": \"sha256-merkle-v1\"}" \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+
+# 3. 逐分片领取租约并上报完成；chunk_digest 必须是 64 位小写十六进制
+curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/complete \
+  -H 'Content-Type: application/json' \
+  -d "{\"lease_token\": \"$TOKEN\", \"chunk_digest\": \"$D0\"}"
+
+# 4. 提交：根与 file_digest 匹配则正常提交；不匹配返回 409 与 computed_digest，
+#    会话保持 active，可 reopen 出错分片、重新上报后再次提交
+curl -s -X POST http://localhost:8000/sessions/$SID/finalize
+# => 409 {"detail": "file digest mismatch", "computed_digest": "<算出的根>"}
+```
+
+状态查询与创建/提交响应均暴露 `digest_algorithm` 字段。旧 SQLite 数据无需重写：
+既有会话的 `digest_algorithm` 不是 `sha256-merkle-v1`，行为完全不变。
 
 ## API 一览
 
@@ -62,7 +124,7 @@ docker compose up --build
 | `POST` | `/sessions/{session_id}/chunks/{index}/complete` | 上报分片完成（幂等；清除退避、保留失败次数） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/reopen` | 完成纠错回退（凭完成时的令牌与摘要，原子重置目标及全部传递下游，`revision` 递增 1） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/fail` | 上报分片失败（校验有效租约，原子清除租约并进入指数退避） |
-| `POST` | `/sessions/{session_id}/finalize` | 提交会话，返回按序分片清单 |
+| `POST` | `/sessions/{session_id}/finalize` | 提交会话，返回按序分片清单（`sha256-merkle-v1` 会话先校验 Merkle 根，不匹配返回 409 及 `computed_digest`） |
 | `GET` | `/healthz` | 健康检查 |
 
 ## 批量领取与并发上限（curl）

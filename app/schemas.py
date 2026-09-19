@@ -1,10 +1,23 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
+
+# 可选完整性校验算法：创建会话时 digest_algorithm 取该值即启用。
+# 启用后 file_digest 与每次 complete 的 chunk_digest 必须是 64 位小写十六进制
+# （SHA-256 的 32 字节十六进制编码），finalize 按分片序号构建 Merkle 树并与
+# file_digest 常量时间比较，不匹配则拒绝提交。
+MERKLE_DIGEST_ALGORITHM = "sha256-merkle-v1"
+_MERKLE_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def is_valid_merkle_digest(value: str) -> bool:
+    """sha256-merkle-v1 的摘要格式：恰好 64 位小写十六进制字符。"""
+    return _MERKLE_DIGEST_RE.fullmatch(value) is not None
 
 
 def validate_dependencies(
@@ -51,9 +64,14 @@ def validate_dependencies(
 
 class CreateSessionRequest(BaseModel):
     total_chunks: int = Field(ge=1, le=100_000, description="总分片数")
-    file_digest: str = Field(min_length=1, max_length=256, description="期望的完整文件摘要")
-    digest_algorithm: str = Field(default="sha256", min_length=1, max_length=32,
-                                  description="摘要算法标识，仅作记录")
+    file_digest: str = Field(
+        min_length=1, max_length=256,
+        description="期望的完整文件摘要；digest_algorithm 为 sha256-merkle-v1 时必须是"
+                    " 64 位小写十六进制（各分片摘要构建的 Merkle 根）")
+    digest_algorithm: str = Field(
+        default="sha256", min_length=1, max_length=32,
+        description="摘要算法标识；取 sha256-merkle-v1 时启用 Merkle 完整性校验，"
+                    "其余取值仅作记录、保持原行为")
     dependencies: Optional[dict[int, list[int]]] = Field(
         default=None,
         description="分片依赖图：键为分片序号，值为该分片领取租约前必须完成的前置分片序号列表；"
@@ -82,6 +100,17 @@ class CreateSessionRequest(BaseModel):
         if self.max_retry_seconds < self.base_retry_seconds:
             raise ValueError(
                 "max_retry_seconds must be greater than or equal to base_retry_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_merkle_file_digest(self):
+        if self.digest_algorithm == MERKLE_DIGEST_ALGORITHM and not is_valid_merkle_digest(
+            self.file_digest
+        ):
+            raise ValueError(
+                "file_digest must be 64 lowercase hex characters "
+                "when digest_algorithm is sha256-merkle-v1"
             )
         return self
 
@@ -148,7 +177,10 @@ class BatchLeaseResponse(BaseModel):
 
 class CompleteRequest(BaseModel):
     lease_token: str = Field(min_length=1, max_length=128, description="当前有效租约令牌")
-    chunk_digest: str = Field(min_length=1, max_length=256, description="该分片的摘要")
+    chunk_digest: str = Field(
+        min_length=1, max_length=256,
+        description="该分片的摘要；会话使用 sha256-merkle-v1 时必须是 64 位小写十六进制"
+                    "（分片原始内容的 SHA-256）")
 
 
 class CompleteResponse(BaseModel):
